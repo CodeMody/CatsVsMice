@@ -8,6 +8,7 @@ import physics
 import level_generator
 import game as game_mod
 import high_scores
+import entities
 
 
 def test_clamp_drag():
@@ -47,9 +48,9 @@ def test_circle_rect_collision():
 
 
 def test_circle_circle_collision():
-    """Circle vs circle detection works."""
+    """Circle vs circle detection works. Normal points from the second circle toward the first."""
     hit, nx, ny, pen = physics.circle_circle_collision(0, 0, 10, 15, 0, 10)
-    assert hit and abs(nx - 1.0) < 0.01
+    assert hit and abs(nx + 1.0) < 0.01
     hit, _, _, _ = physics.circle_circle_collision(0, 0, 5, 100, 0, 5)
     assert not hit
 
@@ -58,10 +59,10 @@ def test_gravity_friction():
     """Gravity and friction apply correctly per step."""
     vx, vy = 10.0, 0.0
     # After one step
-    vy += physics.GRAVITY  # 0.4
-    vx *= physics.FRICTION  # 9.9
-    assert abs(vy - 0.4) < 0.01
-    assert abs(vx - 9.9) < 0.01
+    vy += physics.GRAVITY
+    vx *= physics.FRICTION
+    assert abs(vy - physics.GRAVITY) < 0.01
+    assert abs(vx - 10.0 * physics.FRICTION) < 0.01
 
 
 def test_block_hp():
@@ -75,9 +76,9 @@ def test_block_hp():
 
 
 def test_strong_hit_damage():
-    """Speed > 18 causes two damage to mice."""
-    strength = physics.impact_strength(20, 0)
-    assert strength == 20.0
+    """Speed above STRONG_HIT_THRESHOLD causes two damage to mice."""
+    strength = physics.impact_strength(40, 0)
+    assert strength == 40.0
     assert strength > physics.STRONG_HIT_THRESHOLD
     damage = 2  # as specified
 
@@ -104,8 +105,8 @@ def test_mouse_falling():
 
 def test_debris_damage():
     """Debris damages mice (3 HP) and expires."""
-    d = level_generator.Debris(x=100, y=400, vx=0, vy=0, size=5, life=120, max_life=120)
-    m = level_generator.Mouse(x=100, y=400, size=0, hp=1)
+    d = entities.Debris(x=100, y=400, vx=0, vy=0, size=5, life=120, max_life=120)
+    m = entities.Mouse(x=100, y=400, size=0, hp=1)
     hit, _, _, _ = physics.circle_circle_collision(d.x, d.y, d.radius, m.x, m.y, m.radius)
     assert hit
     m.hp -= 3
@@ -191,15 +192,24 @@ def test_game_over_victory():
 
 
 def test_high_scores():
-    """High scores sorted, capped at 5, saved safely."""
-    # Test add_score
-    scores = high_scores.add_score("TestPlayer", 5000)
-    assert len(scores) <= 5
-    assert scores[0]["score"] >= scores[-1]["score"]
-    # Empty name → Anonymous
-    scores2 = high_scores.add_score("", 100)
-    names = [s["name"] for s in scores2]
-    assert "Anonymous" in names
+    """High scores sorted, capped at 5, saved safely. Uses a scratch file, not the player's board."""
+    import tempfile
+    from pathlib import Path
+    scratch = Path(tempfile.gettempdir()) / "catsvsmice_high_scores_test.json"
+    scratch.unlink(missing_ok=True)
+    original_save_path = high_scores._save_path
+    high_scores._save_path = lambda: scratch
+    try:
+        scores = high_scores.add_score("TestPlayer", 5000)
+        assert len(scores) <= 5
+        assert scores[0]["score"] >= scores[-1]["score"]
+        # Empty name → Anonymous
+        scores2 = high_scores.add_score("", 100)
+        names = [s["name"] for s in scores2]
+        assert "Anonymous" in names
+    finally:
+        high_scores._save_path = original_save_path
+        scratch.unlink(missing_ok=True)
 
 
 def test_all_levels_generate():

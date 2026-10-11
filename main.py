@@ -90,7 +90,9 @@ def main():
             rend.draw_background(game.level, game.frame)
             rend.draw_milestone(game.milestone_frame)
             if game.milestone_frame > 180:
-                _advance_level(game, rend)
+                # The milestone is an intro for game.level (already set by _advance_level),
+                # so start THAT level — advancing again would skip it.
+                game.start_level(game.level)
             pygame.display.flip()
             continue
 
@@ -200,7 +202,8 @@ def _handle_menu_input(game, rend, mouse_pos, mouse_down, clock):
         return
     sx, sy = SCREEN_W / 1920.0, SCREEN_H / 1080.0
     bw, bh = int(274 * sx), int(72 * sy)
-    bx = SCREEN_W // 2 - bw // 2
+    # Must match renderer.Renderer._menu_buttons, which draws buttons at x=795.
+    bx = int(795 * sx)
 
     def btn(y0):
         return (bx, int(y0 * sy) - int(18 * sy), bw, bh)

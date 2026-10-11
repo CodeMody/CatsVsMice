@@ -98,13 +98,11 @@ def circle_circle_collision(cx, cy, r1, mx, my, r2):
 def resolve_bounce(vx, vy, nx, ny, damp):
     """Reflect velocity across normal and apply damping."""
     dot = vx * nx + vy * ny
-    new_vx = vx - 2 * dot * nx
-    new_vy = vy - 2 * dot * ny
-    # Only reflect if moving toward surface
+    # Only reflect if moving toward surface; if already moving away, keep direction.
     if dot < 0:
-        new_vx = vx - 2 * dot * nx
-        new_vy = vy - 2 * dot * ny
-    return new_vx * damp, new_vy * damp
+        vx = vx - 2 * dot * nx
+        vy = vy - 2 * dot * ny
+    return vx * damp, vy * damp
 
 
 def ground_bounce(vx, vy):
