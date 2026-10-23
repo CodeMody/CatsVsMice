@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 
+import numpy as np
 import pygame
 
 import entities
@@ -50,7 +51,9 @@ def test_loader_returns_surfaces():
     """load_assets gives every required key, at the exact game size, with alpha."""
     width, height = 1920, 1080
     assets = renderer_assets.load_assets(width, height)
-    expected = {
+    # literals below are the AUTHORED game slots; the rendered size is slot x the
+    # per-asset factor in renderer_assets.SCALE_OVERRIDES (default SPRITE_SCALE).
+    game_slot = {
         "cat_idle": (54, 54),
         "cat_tail": (53, 46),
         "mouse_small": (44, 36),
@@ -61,11 +64,20 @@ def test_loader_returns_surfaces():
         "debris_wood": (18, 18),
         "debris_stone": (18, 18),
         "dust_puff": (48, 48),
-        "bg_daytime": (width, height),
-        "bg_sunset": (width, height),
-        "bg_night": (width, height),
-        "bg_twilight": (width, height),
     }
+    # the playtest-driven ruling: cats + mice at 1.5x, everything else back at 1x
+    assert renderer_assets.CAT_SCALE == 1.5, f"CAT_SCALE {renderer_assets.CAT_SCALE}"
+    assert renderer_assets.MOUSE_SCALE == 1.5, f"MOUSE_SCALE {renderer_assets.MOUSE_SCALE}"
+    assert renderer_assets.SPRITE_SCALE == 1, f"SPRITE_SCALE {renderer_assets.SPRITE_SCALE}"
+    for key in ("cat_idle", "cat_tail", "supercat"):
+        assert renderer_assets.SCALE_OVERRIDES[key] == 1.5, f"{key} not 1.5x"
+    for key in ("mouse_small", "mouse_medium", "mouse_large"):
+        assert renderer_assets.SCALE_OVERRIDES[key] == 1.5, f"{key} not 1.5x"
+    for key in ("sling_fork", "debris_wood", "debris_stone", "dust_puff"):
+        got = renderer_assets.SCALE_OVERRIDES.get(key, renderer_assets.SPRITE_SCALE)
+        assert got == 1, f"{key} should be back at 1x, is {got}x"
+    expected = {k: renderer_assets._scaled(v, k) for k, v in game_slot.items()}
+    expected.update({name: (width, height) for name in renderer_assets.BG_PLATES})
     for key, size in expected.items():
         assert key in assets, f"missing asset key: {key}"
         surf = assets[key]
@@ -83,7 +95,8 @@ def test_loader_returns_surfaces():
 
     # tinted variants exist for all four themes at the same sizes
     for theme_idx in range(4):
-        for key, size in (("cat_idle", (54, 54)), ("mouse_large", (80, 66))):
+        for key in ("cat_idle", "mouse_large"):
+            size = expected[key]
             tinted = assets[f"{key}@{theme_idx}"]
             assert tinted.get_size() == size, f"tinted {key} resized"
 
@@ -167,10 +180,112 @@ def test_theme_lookup_unchanged():
     assert renderer_mod.lerp_color((0, 0, 0), (100, 200, 300), 0.5) == (50, 100, 150)
 
 
+def test_box_mean_is_a_window_mean():
+    """`box_mean` must be a true mean over (2r+1)^2 windows, edge-replicated."""
+    arr = np.array([[(x * 7 + y * 3) % 256 for x in range(40)] for y in range(24)],
+                   dtype=np.float64)
+    r = 3
+    got = renderer_assets.box_mean(arr, r)
+    h, w = arr.shape
+    want = np.empty_like(got)
+    for y in range(h):
+        for x in range(w):
+            total = 0.0
+            for dy in range(-r, r + 1):
+                yy = min(max(y + dy, 0), h - 1)
+                for dx in range(-r, r + 1):
+                    xx = min(max(x + dx, 0), w - 1)
+                    total += arr[yy, xx]
+            want[y, x] = total / float((2 * r + 1) ** 2)
+    assert got.shape == arr.shape, f"box_mean changed shape: {got.shape}"
+    diff = float(np.abs(got - want).max())
+    assert diff < 1e-9, f"box_mean is not a window mean: max diff {diff:.3f}"
+    # a mean of values <= 255 can never exceed 255
+    assert float(got.max()) <= 255.0 + 1e-9, "box_mean overshoots its input range"
+
+
+def test_tail_pivot_pins_the_base():
+    """The attach point must sit ON the tail art, at an END of its stroke, with the
+    rest of the stroke running up and to the right of it -- that is what keeps the
+    tail pinned to the cat's rear once `draw_cat` puts it at the body's lower-right."""
+    slot = renderer_assets.clean_scale(
+        renderer_assets.matted_surface("cat_tail"),
+        renderer_assets._scaled((53, 46), "cat_tail"))
+    al = pygame.surfarray.array_alpha(slot).transpose(1, 0)      # [y][x]
+    core = al >= 200
+    assert core.any(), "tail plate has no opaque core"
+    px, py = renderer_assets.tail_pivot(slot)
+    assert 0 <= px < al.shape[1] and 0 <= py < al.shape[0], f"pivot {px, py} off the canvas"
+    assert bool(core[py, px]), (
+        f"pivot {px, py} is not on the art: alpha {int(al[py, px])}")
+
+    ys, xs = np.nonzero(core)
+    far = np.hypot(xs - px, ys - py) >= np.max(np.hypot(xs - px, ys - py)) * 0.6
+    vx = float(xs[far].mean()) - px
+    vy = float(ys[far].mean()) - py
+    assert vx > 0, f"tail runs left of its attach point: dx {vx:.1f}"
+    assert vy <= 0, f"tail hangs below its attach point: dy {vy:.1f}"
+    # an end of the stroke, not its middle
+    cxm, cym = float(xs.mean()), float(ys.mean())
+    spread = np.hypot(xs - cxm, ys - cym)
+    at_pivot = float(np.hypot(px - cxm, py - cym))
+    assert at_pivot >= 0.6 * float(spread.max()), (
+        f"attach point is mid-stroke: {at_pivot:.1f} from the core centroid vs "
+        f"{float(spread.max()):.1f} furthest")
+
+
+def test_tail_clears_the_body():
+    """On screen the wagged tail must be attached to the body's lower-right, poke OUT
+    to the right of it, and stay above the ground line."""
+    assets = renderer_assets.load_assets(1920, 1080)
+    idx = 0
+    table = assets[f"cat_tail_rot@{idx}"]
+    assert table, "no tail table for theme 0"
+    r_phys = 27                      # entities.Cat physics radius
+    scale = renderer_assets.CAT_SCALE
+    cx, cy = 960, 700                # probe cat, mid-air like draw_cat's anchor maths
+    ax = cx + int(r_phys * scale * renderer_assets.TAIL_ANCHOR[0])
+    ay = cy + int(r_phys * scale * renderer_assets.TAIL_ANCHOR[1])
+    half = int(r_phys * scale)
+    body_left, body_right = cx - half, cx + half
+    body_top, body_bottom = cy - half, cy + half
+    ground = 1080 - 180              # renderer.GROUND_Y
+    opaque = 0
+    furthest_right = -10 ** 9
+    closest = 10 ** 9
+    below_body = 0
+    for step in range(len(table)):
+        surf = table[step]
+        rect = surf.get_rect(center=(ax, ay))
+        alpha = pygame.surfarray.array_alpha(surf).transpose(1, 0)      # [y][x]
+        ys, xs = np.where(alpha >= 200)
+        if not len(xs):
+            continue
+        sx = xs + rect.left
+        sy = ys + rect.top
+        opaque += len(xs)
+        furthest_right = max(furthest_right, int(sx.max()))
+        # distance from each tail pixel to the body's bounding box (0 when inside it)
+        dx = np.maximum(np.maximum(body_left - sx, sx - body_right), 0)
+        dy = np.maximum(np.maximum(body_top - sy, sy - body_bottom), 0)
+        closest = min(closest, int(np.min(np.hypot(dx, dy))))
+        below_body += int((sy > body_bottom + 6).sum())
+    assert opaque > 0, "tail table is empty"
+    assert furthest_right > body_right, (
+        f"tail never pokes out past the body edge x={body_right}: furthest x "
+        f"{furthest_right}")
+    assert closest <= 4, f"tail floats off the body: nearest gap {closest} px"
+    assert below_body < opaque * 0.35, (
+        f"most of the tail hangs below the body (below_body {below_body} of {opaque})")
+
+
 def run_tests():
     tests = [
         test_asset_paths_resolve,
         test_loader_returns_surfaces,
+        test_box_mean_is_a_window_mean,
+        test_tail_pivot_pins_the_base,
+        test_tail_clears_the_body,
         test_strip_crop_widths,
         test_headless_frame,
         test_milestone_and_menu_paths,

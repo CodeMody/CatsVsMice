@@ -56,6 +56,16 @@ class Renderer:
         self.H = surface.get_height()
         # Phase 3: matting + scaling happen ONCE here; every draw_* only blits.
         self.assets = renderer_assets.load_assets(self.W, self.H)
+        # Size knobs live in renderer_assets. Blocks/debris read SPRITE_SCALE (back
+        # at 1x after playtesting the 2x build); only draw_cat reads CAT_SCALE, because
+        # it sizes the body from the physics radius instead of trusting the asset.
+        # draw_mouse / draw_supercat / draw_sling need no knob at all -- they blit
+        # whatever size load_assets handed out, so their scale comes for free.
+        self.sprite_scale = renderer_assets.SPRITE_SCALE
+        self.cat_scale = renderer_assets.CAT_SCALE
+        # tail anchor fractions of the body half-size, so the tail can be nudged
+        # without touching draw_cat's maths again
+        self.tail_anchor = renderer_assets.TAIL_ANCHOR
         self.theme_idx = 0  # set by draw_background; draw_block/draw_debris read it
         # id(theme) -> THEMES key so draw_cat/draw_mouse look a theme up in O(1)
         # instead of scanning THEMES once per entity per frame. THEMES is untouched.
@@ -183,6 +193,7 @@ class Renderer:
     def draw_cat(self, cat, theme, idle=False, frame=0):
         x, y = int(cat.x), int(cat.y)
         r = int(cat.radius)
+        S = self.cat_scale
         idx = self.theme_by_id.get(id(theme), self.theme_idx)
         body = self.assets.get(f"cat_idle@{idx}")
         if body is None:
@@ -224,13 +235,17 @@ class Renderer:
                 s = math.sin(frame * 0.1)
                 step = int(round((s + 1.0) * (len(table) - 1) / 2.0))
                 step = max(0, min(len(table) - 1, step))
-                tail_rect = table[step].get_rect(center=(x + int(r * 0.71), y + int(r * 0.71)))
+                # anchor scales with the BODY, not the physics radius, so the tail
+                # stays attached to the lower-right of a 2x body
+                ax = x + int(r * S * self.tail_anchor[0])
+                ay = y + int(r * S * self.tail_anchor[1])
+                tail_rect = table[step].get_rect(center=(ax, ay))
                 self.surf.blit(table[step], tail_rect.topleft)
         sprite = body
-        size = (2 * r, 2 * r)
+        size = (2 * r * S, 2 * r * S)
         if sprite.get_size() != size:
             sprite = pygame.transform.smoothscale(sprite, size)
-        self.surf.blit(sprite, (x - r, y - r))
+        self.surf.blit(sprite, (x - size[0] // 2, y - size[1] // 2))
 
     def draw_mouse(self, mouse, theme, frame=0):
         if not mouse.alive:
@@ -281,19 +296,23 @@ class Renderer:
             return
         x, y, w, h = int(block.x), int(block.y), int(block.w), int(block.h)
         mat = "wood" if block.material == "wood" else "stone"
+        S = self.sprite_scale
         # centred crop of the strip's ACTUAL height, sliced to this block's width;
         # x_off shifts the slice so stacked blocks do not repeat the same grain.
-        # `_STRIPS` caches RAW crops, so pay `_finish` once per (material, height,
-        # theme) for THIS Renderer and blit aliased subsurfaces of that display copy
+        # `_STRIPS` caches RAW crops, so pay `_finish` once per (material, DISPLAYED
+        # height, theme) for THIS Renderer and blit aliased subsurfaces of that display copy
         # every frame -- see strip_tile's docstring: a tile must never be written into.
-        key = (mat, h, self.theme_idx)
+        dw, dh = w * S, h * S
+        key = (mat, dh, self.theme_idx)
         strip = self.strip_display.get(key)
         if strip is None:
             strip = renderer_assets._finish(
-                renderer_assets.strip_crop(mat, h, self.theme_idx))
+                renderer_assets.strip_crop(mat, dh, self.theme_idx))
             self.strip_display[key] = strip
-        tile = renderer_assets.strip_slice(strip, w, h, x_off=x)
-        self.surf.blit(tile, (x, y))
+        tile = renderer_assets.strip_slice(strip, dw, dh, x_off=x)
+        # art grows about the block's BOTTOM centre, so a 2x block still plants on
+        # the ground line instead of floating; its hitbox stays (w, h) at (x, y).
+        self.surf.blit(tile, (x + (w - dw) // 2, y + h - dh))
         # Phase 2 verdict: NO masonry outline -- the baked joints already read as
         # grid lines once blocks tile (crop gradient 19.07 wood / 16.71 stone vs
         # 4.8..8.4 seam deltas), and an added edge doubled them.
@@ -305,6 +324,7 @@ class Renderer:
             pygame.draw.circle(self.surf, c, (int(p.x), int(p.y)), max(2, int(p.size * p.life / p.max_life)))
 
     def draw_debris(self, debris_list: List):
+        S = self.sprite_scale
         for d in debris_list:
             c = d.color
             key = None
@@ -320,14 +340,14 @@ class Renderer:
                 pygame.draw.rect(self.surf, c, (int(d.x - d.size // 2),
                                                 int(d.y - d.size // 2), d.size, d.size))
                 continue
-            size = max(1, int(d.size))
+            size = max(1, int(d.size)) * S
             if sprite.get_size() != (size, size):
                 sprite = pygame.transform.smoothscale(sprite, (size, size))
             alpha = max(0, min(255, int(255 * d.life / d.max_life)))
             if alpha < 255:
                 sprite = sprite.copy()
                 sprite.set_alpha(alpha)
-            self.surf.blit(sprite, (int(d.x - d.size // 2), int(d.y - d.size // 2)))
+            self.surf.blit(sprite, (int(d.x - size // 2), int(d.y - size // 2)))
 
     def draw_trajectory(self, sx, sy, vx, vy):
         from physics import trajectory_preview
