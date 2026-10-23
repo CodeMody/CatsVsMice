@@ -1,7 +1,7 @@
 
 # Cats vs Mice
 
-A physics-based projectile game built with **Python 3.12** and **pygame**, inspired by the classic slingshot-launch genre. Launch cats from a slingshot to knock out mice hidden inside destructible structures. The game features 50 procedurally generated levels, milestones, challenge levels, high-score leaderboards, and procedural audio — all without any external asset dependencies beyond a single optional background music file.
+A physics-based projectile game built with **Python 3.12** and **pygame**, inspired by the classic slingshot-launch genre. Launch cats from a slingshot to knock out mice hidden inside destructible structures. The game features 50 procedurally generated levels, milestones, challenge levels, high-score leaderboards, and procedural audio — graphics are pre-baked PNG assets generated with ComfyUI (`moss-image-sft`, one seed for the whole set) and shipped from `assets/generated/` inside the build, while audio needs no files beyond a single optional background music file.
 
 ---
 
@@ -105,7 +105,7 @@ Standalone constants and pure functions (fully testable):
 Helpers: `_surface_clear`, `_pick_free_ground_x`, `_pick_mouse_size`.
 
 ### `renderer.py` — Rendering
-`Renderer` draws everything with pygame primitives (no sprite assets). Four theme palettes (`THEMES`) cycle by level via `get_theme()`: Daytime, Sunset, Night, Twilight. Provides drawing routines for backgrounds (animated sky, sun/moon, hills, trees, grass, clouds, stars), slingshot, cat, mice, blocks, particles, debris, trajectory, HUD, menu, scoreboard, completion, game-over, victory, and the milestone "SuperCat" animation.
+`Renderer` is asset-first: it blits pre-baked PNG plates from `assets/generated/` (loaded and cached once by `renderer_assets.py`, which also downscales every sprite to its game size at load time) and paints only the procedural parts on top. Four theme palettes (`THEMES`) cycle by level via `get_theme()`: Daytime, Sunset, Night, Twilight — the matching full-screen background plate cycles with them every 5 levels. Provides drawing routines for backgrounds (blitted plate plus procedural clouds and twinkling stars; sun/moon, hills, trees and grass are baked into the plate), slingshot, cat, mice, blocks, particles, debris, trajectory, HUD, menu, scoreboard, completion, game-over, victory, and the milestone "SuperCat" animation.
 
 ### `audio.py` — Procedural audio
 Generates all sound effects at runtime as WAV bytes (`generate_sound`) — no audio asset files required. Provides `meow`, `thud`, `crunch`, `squeak`, `whoosh`, `ouch`. Background music is loaded from `assets/ambient_loop.wav` if present. `AudioManager` singleton exposes `ensure_ready()` (must be called after `pygame.init()`), `play(name)`, `set_volume(v)`, `get_volume()`. All audio failures are swallowed so audio never crashes the game.
@@ -165,7 +165,7 @@ All SFX are procedurally synthesized (sine/envelope math → WAV bytes) and load
 
 ## Rendering & Themes
 
-No external image assets — all graphics are drawn with pygame primitives. Four themes cycle every 5 levels: Daytime → Sunset → Night → Twilight. Night/Twilight add twinkling stars. UI scales to the real display surface.
+Graphics are pre-baked PNG assets in `assets/generated/` — generated with ComfyUI (`moss-image-sft`, one seed for the whole set) — not pygame primitives. Sprites are keyed on a flat magenta backdrop and matted at load time (despill + feather, with an alpha clamp); each theme applies a multiply tint (×1.0 / ×0.8221 / ×0.25 / ×0.644) plus an additive grey lift; background plates are 1920×1072 full-bleed art blitted at their native aspect (the per-theme vertical offsets are now all zero) so each plate's unbroken lawn band covers the game floor at `H - 180` with margin; `cat_tail.png` is a separate sprite driven by a load-time rotation table whose twelve wag frames are pinned at the tail stroke's base end (that end and the plate's symmetry are chosen at load time, so a re-rolled plate stays attached however its art is oriented), anchored at mid-rump height via the `TAIL_ANCHOR` knob in `renderer_assets.py`; no contact shadow is drawn under sprites. Particles, trajectory, HUD and menus stay procedural. Four themes cycle every 5 levels: Daytime → Sunset → Night → Twilight. Night/Twilight add twinkling stars. UI scales to the real display surface.
 
 ---
 
@@ -186,7 +186,9 @@ The game is compiled into a single-file Windows executable using **PyInstaller**
 
 | Path | Description |
 |------|-------------|
-| `CatsVsMice.spec` | PyInstaller build specification: entry point `main.py`, bundles `assets/` as a data directory, UPX-compressed, windowed (no console), single-file output |
+| `CatsVsMice.spec` | PyInstaller build specification: entry point `main.py`, bundles the whole `assets/` folder as a data directory (`datas=[('assets', 'assets')]` — recursive, so every PNG under `assets/generated/` ships automatically and no per-file entries are needed), UPX-compressed, windowed (no console), single-file output that unpacks into PyInstaller's temporary `_MEIPASS` folder at launch |
+| `renderer_assets.py` | Asset loader/cache imported transitively (`main.py` → `renderer.py` → `renderer_assets.py`): reads the PNGs from `assets/generated/`, mattes and downscales them once per process, and resolves paths through `sys._MEIPASS` when running frozen |
+| `assets/generated/` | The 16 pre-baked PNG plates/sprites generated with ComfyUI (`moss-image-sft`, one seed for the whole set); bundled as data by the spec and shipped inside the single-file EXE (`mouse_small/medium/large.png` are byte-identical copies kept separate so all three loader keys resolve) |
 | `build/` | Intermediate compilation artifacts produced by PyInstaller (safe to delete; regenerated on each build) |
 | `dist/CatsVsMice.exe` | The final standalone game — pygame and all project modules are bundled inside; no Python installation needed to run it |
 
