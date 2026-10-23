@@ -1,5 +1,6 @@
 """All rendering: backgrounds, themes, entities, particles, UI."""
 import math
+import random
 import pygame
 from typing import List, Tuple
 
@@ -56,6 +57,20 @@ class Renderer:
         # Phase 3: matting + scaling happen ONCE here; every draw_* only blits.
         self.assets = renderer_assets.load_assets(self.W, self.H)
         self.theme_idx = 0  # set by draw_background; draw_block/draw_debris read it
+        # id(theme) -> THEMES key so draw_cat/draw_mouse look a theme up in O(1)
+        # instead of scanning THEMES once per entity per frame. THEMES is untouched.
+        self.theme_by_id = {id(t): i for i, t in THEMES.items()}
+        # Star positions are fixed, so random.Random(42) + 60 draws run ONCE here
+        # rather than every frame; only themes idx >= 2 blit them.
+        rng = random.Random(42)
+        star_floor = max(0, int((self.H - 180) * 0.6))   # same bound as the old per-frame draw
+        self.stars = [(rng.randint(0, self.W), rng.randint(0, star_floor))
+                      for _ in range(60)]
+        # Display-format copies of the raw shared strips (renderer_assets._STRIPS
+        # stays raw), converted once per instance so pygame takes its fast blit path.
+        self.strip_display = {}
+        # Per-theme band that paints the screen rows a plate misses when blitted off.
+        self.bg_gap = {}
 
     def draw_background(self, level, frame_count):
         theme = get_theme(level)
@@ -66,6 +81,11 @@ class Renderer:
         if plate is not None:
             # verification.json offset_to_900 lands the plate's grass line on ground_y
             self.surf.blit(plate, (0, BG_OFFSET[idx]))
+            # A (W,H) plate blitted at an offset leaves rows outside it untouched --
+            # main.py never clears the screen, so those rows keep stale/black pixels.
+            # Fill them from the plate's own edge row; the scale and blit y stay put,
+            # so the plate's ground line still lands on ground_y (0 px of drift).
+            self._paint_bg_gap(idx, BG_OFFSET[idx], plate)
         else:
             # stand-in for a missing/corrupt plate only
             for y in range(0, ground_y, 4):
@@ -76,11 +96,9 @@ class Renderer:
 
         # Stars (night/twilight only — matches get_theme's palette index)
         if idx >= 2:
-            import random
-            rng = random.Random(42)
-            for _ in range(60):
-                stx = rng.randint(0, self.W)
-                sty = rng.randint(0, int(ground_y * 0.6))
+            # positions come from self.stars (built once in __init__); only the
+            # twinkle brightness depends on frame_count.
+            for stx, sty in self.stars:
                 bright = min(255, 150 + int(80 * abs(math.sin(frame_count * 0.02 + stx * 0.1))))
                 star_col = (bright, bright, min(255, bright + 30))
                 pygame.draw.circle(self.surf, star_col, (stx, sty), 2)
@@ -100,33 +118,72 @@ class Renderer:
             pygame.draw.circle(self.surf, theme["cloud"], (int(cx + 34), int(cy - 9)), 45)
             pygame.draw.circle(self.surf, theme["cloud"], (int(cx + 69), int(cy)), 50)
 
+    def _paint_bg_gap(self, idx, off, plate):
+        """Paint the screen rows a (W,H) plate misses when it is blitted at `off`.
+
+        BG_OFFSET shifts the plate vertically, so rows above it (off > 0) or below
+        it (off < 0) keep whatever was on the screen from last frame -- measured as
+        a 13 px black stripe for theme 0 and 75/21/48 stale top rows for themes 1..3.
+        The band is filled from the plate's OWN edge row (top row for off > 0, bottom
+        row for off < 0), which keeps the plate's scale and blit y untouched, so its
+        ground line still lands on ground_y. Built once per theme per Renderer, then
+        it costs one blit per frame.
+        """
+        if off == 0:
+            return
+        band = self.bg_gap.get(idx)
+        if band is None:
+            k = abs(off)
+            if off > 0:
+                edge = plate.subsurface((0, 0, self.W, 1))
+                pos = (0, 0)
+            else:
+                edge = plate.subsurface((0, self.H - 1, self.W, 1))
+                pos = (0, self.H - k)
+            fill = pygame.Surface((self.W, k), pygame.SRCALPHA)
+            for i in range(k):
+                fill.blit(edge, (0, i))
+            band = (renderer_assets._finish(fill), pos)
+            self.bg_gap[idx] = band
+        self.surf.blit(band[0], band[1])
+
     def draw_sling(self, sx, sy, drag=None):
         fork = self.assets.get(f"sling_fork_big@{self.theme_idx}")
         if fork is None:
             fork = self.assets.get("sling_fork_big")
+        origin = None
         if fork is not None:
             pin = self.assets["sling_fork_pin"]
+            origin = (int(sx - pin[0]), int(sy + 144 - pin[1]))
             # art keeps its own shape; trunk base pinned to (sx, sy+144) = (315, 900)
-            self.surf.blit(fork, (int(sx - pin[0]), int(sy + 144 - pin[1])))
+            self.surf.blit(fork, origin)
         else:
             # Y-shaped slingshot (fallback when the plate is missing)
             pygame.draw.line(self.surf, (100, 60, 20), (sx, sy + 144), (sx, sy), 11)
             pygame.draw.line(self.surf, (100, 60, 20), (sx, sy), (sx - 27, sy - 54), 7)
             pygame.draw.line(self.surf, (100, 60, 20), (sx, sy), (sx + 27, sy - 54), 7)
-        # Fork tips: the rubber band stays procedural on the OLD tip coordinates,
-        # so launch geometry never depends on the sprite extent.
-        pygame.draw.circle(self.surf, (140, 80, 30), (sx - 27, sy - 54), 7)
-        pygame.draw.circle(self.surf, (140, 80, 30), (sx + 27, sy - 54), 7)
+        # Fork tips now come from the ART's own prongs (`prong_tips` measured once in
+        # load_assets), so the band and its knobs line up with the drawn fork instead
+        # of the old procedural (sx +/- 27, sy - 54) pair that sat elsewhere. Launch
+        # geometry is untouched: game.py/main.py still launch from (sling_x, sling_y-27).
+        tips = self.assets.get("sling_fork_tips")
+        if origin is not None and tips is not None and tips[0] is not None and tips[1] is not None:
+            anchors = ((origin[0] + tips[0][0], origin[1] + tips[0][1]),
+                       (origin[0] + tips[1][0], origin[1] + tips[1][1]))
+        else:
+            anchors = ((sx - 27, sy - 54), (sx + 27, sy - 54))
+        pygame.draw.circle(self.surf, (140, 80, 30), anchors[0], 7)
+        pygame.draw.circle(self.surf, (140, 80, 30), anchors[1], 7)
         # Rubber band stretched to the pull-back handle
         if drag is not None:
             bx, by = int(drag[0]), int(drag[1])
-            pygame.draw.line(self.surf, (70, 45, 25), (sx - 27, sy - 54), (bx, by), 4)
-            pygame.draw.line(self.surf, (70, 45, 25), (sx + 27, sy - 54), (bx, by), 4)
+            pygame.draw.line(self.surf, (70, 45, 25), anchors[0], (bx, by), 4)
+            pygame.draw.line(self.surf, (70, 45, 25), anchors[1], (bx, by), 4)
 
     def draw_cat(self, cat, theme, idle=False, frame=0):
         x, y = int(cat.x), int(cat.y)
         r = int(cat.radius)
-        idx = next((i for i, t in THEMES.items() if t is theme), self.theme_idx)
+        idx = self.theme_by_id.get(id(theme), self.theme_idx)
         body = self.assets.get(f"cat_idle@{idx}")
         if body is None:
             body = self.assets.get("cat_idle")
@@ -180,7 +237,7 @@ class Renderer:
             return
         x, y = int(mouse.x), int(mouse.y)
         r = mouse.radius
-        idx = next((i for i, t in THEMES.items() if t is theme), self.theme_idx)
+        idx = self.theme_by_id.get(id(theme), self.theme_idx)
         key = MOUSE_KEYS_BY_RADIUS.get(int(r))
         if key is None:
             key = MOUSE_KEYS_BY_SIZE[max(0, min(2, int(mouse.size)))]
@@ -226,7 +283,16 @@ class Renderer:
         mat = "wood" if block.material == "wood" else "stone"
         # centred crop of the strip's ACTUAL height, sliced to this block's width;
         # x_off shifts the slice so stacked blocks do not repeat the same grain.
-        tile = renderer_assets.strip_tile(mat, w, h, self.theme_idx, x_off=x)
+        # `_STRIPS` caches RAW crops, so pay `_finish` once per (material, height,
+        # theme) for THIS Renderer and blit aliased subsurfaces of that display copy
+        # every frame -- see strip_tile's docstring: a tile must never be written into.
+        key = (mat, h, self.theme_idx)
+        strip = self.strip_display.get(key)
+        if strip is None:
+            strip = renderer_assets._finish(
+                renderer_assets.strip_crop(mat, h, self.theme_idx))
+            self.strip_display[key] = strip
+        tile = renderer_assets.strip_slice(strip, w, h, x_off=x)
         self.surf.blit(tile, (x, y))
         # Phase 2 verdict: NO masonry outline -- the baked joints already read as
         # grid lines once blocks tile (crop gradient 19.07 wood / 16.71 stone vs
@@ -328,8 +394,7 @@ class Renderer:
         txt2 = font2.render(f"Final Score: {score}", True, (255, 255, 255))
         self.surf.blit(txt2, (715, 450))
         # Fireworks
-        import random
-        rng = random.Random(frame)
+        rng = random.Random(frame)   # module-level import; seeded per call as before
         for _ in range(8):
             fx = rng.randint(274, 1646)
             fy = rng.randint(180, 720)

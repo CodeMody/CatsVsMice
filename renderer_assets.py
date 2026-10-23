@@ -36,8 +36,13 @@ SPRITE_TARGETS = {
     "supercat": (300, 260),
     "debris_wood": (18, 18),
     "debris_stone": (18, 18),
-    "dust_puff": (48, 48),     # loaded for later use; particles stay procedural
 }
+
+# Art nothing blits today, kept OUT of SPRITE_TARGETS so startup never pays its
+# matte: handed out blank at the exact game size and matted on demand by
+# `LazySprite.materialize()` (particles stayed procedural -- Phase 2 ruling).
+LAZY_SPRITES = {"dust_puff": (48, 48)}
+
 MOUSE_SIZES = {"mouse_small": (44, 36), "mouse_medium": (58, 48), "mouse_large": (80, 66)}
 MOUSE_KEYS_BY_RADIUS = {22: "mouse_small", 29: "mouse_medium", 40: "mouse_large"}
 MOUSE_KEYS_BY_SIZE = ("mouse_small", "mouse_medium", "mouse_large")
@@ -45,8 +50,16 @@ FORK_LARGE = (300, 195)       # 1.5x the 200x130 game slot, aspect preserved
 TAIL_STEPS = 12               # wag table indexed by sin(frame * 0.1)
 MOUSE_PLATE = "mouse_large"   # mouse_small/medium are byte-identical copies
 
+# _MATTED INTENTIONALLY keeps every full-res matted canvas alive for the whole
+# process lifetime (~18 MB of un-scaled canvases): matting a plate costs tens of
+# ms, so it is never redone and there is no eviction to trade off. These Surfaces
+# are NOT display-converted -- only the game-size copies load_assets hands out
+# ever go through _finish, which is also why they cannot be blitted fast.
 _MATTED = {}                  # name -> un-converted SRCALPHA Surface at canvas size
-_STRIPS = {}                  # (material, height, theme_idx) -> full-width crop
+_STRIPS = {}                  # (material, height, theme_idx) -> RAW (pre-_finish) crop
+                              # tinted full-width crop; each Renderer converts its own
+                              # display copy (Renderer.strip_display) once, so the
+                              # first Renderer to run cannot fix the pixel format.
 
 
 def _asset_path(name):
@@ -157,6 +170,30 @@ def clean_scale(img, size):
     return scaled
 
 
+class LazySprite(pygame.Surface):
+    """Game-size Surface whose art is built the first time `.materialize()` runs.
+
+    Keys in `LAZY_SPRITES` go through this instead of SPRITE_TARGETS, so a plate
+    nothing blits never pays its ~50 ms matte at startup. It IS a pygame.Surface
+    (subclass) and is blank/fully transparent until materialized -- anything that
+    ever wants to draw it must call `assets[key].materialize()` first, which
+    fills this same surface in place and returns it for the caller to `_finish`.
+    No tinted `key@idx` variants are made for lazy keys while nothing reads them.
+    """
+    def __init__(self, size, source):
+        super().__init__(size, pygame.SRCALPHA)
+        self.source = source
+        self.built = False
+
+    def materialize(self):
+        """Pay the matte once and paint it into THIS surface (identity kept)."""
+        if not self.built:
+            art = clean_scale(matted_surface(self.source), self.get_size())
+            self.blit(art, (0, 0))   # dest starts fully transparent -> source passes through
+            self.built = True
+        return self
+
+
 def tint_surface(src, mult, lift):
     """Multiply + additive grey lift on the RGB channels; alpha untouched."""
     out = src.copy()
@@ -223,6 +260,9 @@ def load_assets(width, height):
     for name, size in SPRITE_TARGETS.items():
         raw[name] = clean_scale(matted_surface(name), size)
         assets[name] = _finish(raw[name])
+    # kept as a key so callers can find it, but blank until something materializes
+    for name, size in LAZY_SPRITES.items():
+        assets[name] = LazySprite(size, name)
     # one mouse plate serves three sizes
     for key, size in MOUSE_SIZES.items():
         if key == MOUSE_PLATE:
@@ -289,7 +329,14 @@ def _plate_surface(name):
 
 
 def strip_crop(material, height, theme_idx=0):
-    """Full-width centred crop of a strip at `height`, tinted for `theme_idx`."""
+    """Full-width centred crop of a strip at `height`, tinted for `theme_idx`.
+
+    The cached value is the RAW, pre-`_finish` crop: `_STRIPS` must never hold
+    display-format pixels, because pygame picks the blit path from the source's
+    format and the first Renderer to run would otherwise hand every later one an
+    already-converted (or un-converted) surface. Each Renderer converts its own
+    display copy once (`Renderer.strip_display`), which is where `_finish` runs.
+    """
     key = (material, height, theme_idx)
     cached = _STRIPS.get(key)
     if cached is not None:
@@ -304,14 +351,13 @@ def strip_crop(material, height, theme_idx=0):
     if h != height:
         surf = pygame.transform.smoothscale(surf, (sw, height))
     mult, lift = TINT[theme_idx]
-    out = _finish(tint_surface(surf, mult, lift))
+    out = tint_surface(surf, mult, lift)   # RAW on purpose -- see the docstring
     _STRIPS[key] = out
     return out
 
 
-def strip_tile(material, width, height, theme_idx=0, x_off=0):
-    """Slice (or repeat the slice) so the block gets exactly (width, height)."""
-    crop = strip_crop(material, height, theme_idx)
+def strip_slice(crop, width, height, x_off=0):
+    """Slice (or repeat the slice) of `crop` so the block gets exactly (width, height)."""
     cw, ch = crop.get_size()
     if width <= cw:
         x = int(x_off) % max(cw - width, 1)
@@ -323,3 +369,19 @@ def strip_tile(material, width, height, theme_idx=0, x_off=0):
         out.blit(crop.subsurface((0, 0, tw, height)), (x, 0))
         x += tw
     return out
+
+
+def strip_tile(material, width, height, theme_idx=0, x_off=0):
+    """Slice (or repeat the slice) so the block gets exactly (width, height).
+
+    ALIASING, documented rather than copied (the doc and the code match): for a
+    block no wider than the source strip the returned Surface is a `subsurface`
+    VIEW of the shared full-width crop -- it shares that crop's pixels, allocates
+    nothing per block per frame, and must never be written into (no set_at, no
+    surfarray assignment, no set_alpha on the tile itself). Renderer.draw_block
+    only blits, so aliasing is safe there. Only the wide branch (a block wider
+    than the strip) returns a fresh Surface, which callers may mutate freely.
+    The view is raw unless the caller passed a converted strip; Renderer.draw_block
+    slices its own `_finish`ed copy in `Renderer.strip_display`.
+    """
+    return strip_slice(strip_crop(material, height, theme_idx), width, height, x_off)
