@@ -285,6 +285,3 @@ Requires **Python 3.12**, **pygame** and **Pillow** (`pip install pygame Pillow`
 - `Esc` — quit.
 - In name-input: type your name, `Backspace` to edit, `Enter` to confirm.
 
----
-
-*Generated project documentation — see individual module docstrings for detailed API references.*
