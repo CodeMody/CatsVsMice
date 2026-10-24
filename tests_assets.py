@@ -279,6 +279,102 @@ def test_tail_clears_the_body():
         f"most of the tail hangs below the body (below_body {below_body} of {opaque})")
 
 
+def test_cloud_asset_is_cropped_to_its_cloud():
+    """`cloud.png` is a 512x512 plate whose key residue reaches every edge, so the
+    loader must crop to the cloud itself and scale it preserving the blob's aspect."""
+    assets = renderer_assets.load_assets(1920, 1080)
+    surf = assets.get("cloud")
+    assert surf is not None, "loader hands out no 'cloud' asset"
+    want = renderer_assets._scaled(renderer_assets.CLOUD_SLOT, "cloud")
+    assert surf.get_size() == want, f"cloud slot {surf.get_size()} != {want}"
+    al = pygame.surfarray.array_alpha(surf).transpose(1, 0)      # [y][x]
+    ys, xs = np.nonzero(al >= 200)
+    assert len(xs) > 0, "cloud asset has no opaque body"
+    # tightly cropped: the body must reach all four edges of the slot
+    assert xs.min() == 0 and xs.max() == surf.get_width() - 1, \
+        f"cloud not cropped horizontally: x {xs.min()}..{xs.max()} of {surf.get_width()}"
+    assert ys.min() == 0 and ys.max() == surf.get_height() - 1, \
+        f"cloud not cropped vertically: y {ys.min()}..{ys.max()} of {surf.get_height()}"
+    aspect = surf.get_width() / float(surf.get_height())
+    assert abs(aspect - 1.75) < 0.12, f"cloud aspect {aspect:.2f} distorts the plate's blob"
+
+
+def test_cloud_tinted_variants_exist_for_every_theme():
+    """Clouds get Phase 2's tint like every other sprite: same silhouette, four tints."""
+    assets = renderer_assets.load_assets(1920, 1080)
+    base = assets["cloud"]
+    al = pygame.surfarray.array_alpha(base).transpose(1, 0)
+    for idx in range(4):
+        tinted = assets.get(f"cloud@{idx}")
+        assert tinted is not None, f"no tinted cloud for theme {idx}"
+        assert tinted.get_size() == base.get_size(), f"theme {idx} cloud resized"
+        assert np.array_equal(pygame.surfarray.array_alpha(tinted).transpose(1, 0), al), \
+            f"theme {idx} tint changed the cloud silhouette"
+    day = pygame.surfarray.array3d(assets["cloud@0"]).transpose(1, 0, 2)
+    night = pygame.surfarray.array3d(assets["cloud@2"]).transpose(1, 0, 2)
+    solid = al >= 200
+    assert int(day[solid].sum()) > int(night[solid].sum()), \
+        "night cloud is not darker than the daytime one"
+
+
+def test_cloud_positions_drift_and_wrap():
+    """Cloud centres come from a shared helper: steady drift, and they wrap through
+    the off-screen margins instead of popping at the screen edge."""
+    W, H = 1920, 1080
+    slot = renderer_assets._scaled(renderer_assets.CLOUD_SLOT, "cloud")
+    half = slot[0] // 2
+    p0 = renderer_assets.cloud_positions(W, H, 0)
+    p40 = renderer_assets.cloud_positions(W, H, 40)
+    assert len(p0) == 3, f"expected three clouds, got {len(p0)}"
+    for (x0, y0), (x1, y1) in zip(p0, p40):
+        assert abs((x1 - x0) - renderer_assets.CLOUD_SPEED * 40) <= 1.0, \
+            f"cloud moved {x1 - x0:.1f} px over 40 frames, speed is " \
+            f"{renderer_assets.CLOUD_SPEED}"
+        assert y0 == y1, "cloud rows moved vertically"
+    rows = [y for _, y in p0]
+    assert sorted(rows) == rows and len(set(rows)) == 3, f"cloud rows not stacked: {rows}"
+    xs = [x for x, _ in renderer_assets.cloud_positions(W, H, 7000)]
+    assert min(xs) >= -half and max(xs) <= W + half, \
+        f"clouds leave the wrap band: x {min(xs)}..{max(xs)} against {-half}..{W + half}"
+
+
+def test_background_blits_the_cloud_plate():
+    """draw_background must blit the cloud sprite over the plate, not draw circles:
+    every cloud region has to match a plate+sprite blend pixel for pixel."""
+    assets = renderer_assets.load_assets(1920, 1080)
+    surf = pygame.Surface((1920, 1080), pygame.SRCALPHA)
+    rend = renderer_mod.Renderer(surf)
+    frame = None
+    slot = renderer_assets._scaled(renderer_assets.CLOUD_SLOT, "cloud")
+    half = slot[0] // 2
+    for f in range(0, 400):
+        pos = renderer_assets.cloud_positions(1920, 1080, f)
+        if all(half <= x <= 1920 - half for x, _ in pos):
+            frame = f
+            break
+    assert frame is not None, "no frame puts all three clouds fully on screen"
+
+    rend.draw_background(1, frame_count=frame)
+    got = pygame.surfarray.array3d(surf).transpose(1, 0, 2)          # [y][x][3]
+    plate = pygame.surfarray.array3d(assets["bg_daytime"]).transpose(1, 0, 2)
+    cloud = assets["cloud@0"]
+    c_rgb = pygame.surfarray.array3d(cloud).transpose(1, 0, 2)
+    c_al = pygame.surfarray.array_alpha(cloud).transpose(1, 0) / 255.0
+
+    checked = 0
+    for cx, cy in renderer_assets.cloud_positions(1920, 1080, frame):
+        left = int(cx - slot[0] // 2)
+        top = int(cy - slot[1] // 2)
+        want = plate[top:top + slot[1], left:left + slot[0]] * (1.0 - c_al[:, :, None]) \
+            + c_rgb * c_al[:, :, None]
+        region = got[top:top + slot[1], left:left + slot[0]]
+        assert region.shape == want.shape, f"cloud region {region.shape} != sprite {want.shape}"
+        diff = float(np.abs(region.astype(np.int32) - np.round(want)).mean())
+        assert diff < 4.0, f"cloud at ({cx},{cy}) is not the plate sprite: mean L1 {diff:.1f}"
+        checked += 1
+    assert checked == 3, f"only {checked} clouds checked"
+
+
 def run_tests():
     tests = [
         test_asset_paths_resolve,
@@ -290,6 +386,10 @@ def run_tests():
         test_headless_frame,
         test_milestone_and_menu_paths,
         test_theme_lookup_unchanged,
+        test_cloud_asset_is_cropped_to_its_cloud,
+        test_cloud_tinted_variants_exist_for_every_theme,
+        test_cloud_positions_drift_and_wrap,
+        test_background_blits_the_cloud_plate,
     ]
     passed = 0
     failed = 0
