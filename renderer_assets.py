@@ -37,6 +37,18 @@ BG_PLATES = ("bg_daytime", "bg_sunset", "bg_night", "bg_twilight")
 # would put structures on hills instead of grass.
 BG_OFFSET = {0: 0, 1: 0, 2: 0, 3: 0}
 
+# Cloud sprite knobs. cloud.png is a 512x512 plate whose key residue reaches every
+# canvas edge (alpha > 0 crops nothing), so it is cropped to its opaque body first:
+# that body measures 500x285 (aspect 1.754), and CLOUD_SLOT keeps that aspect so the
+# cloud is never squashed. The three drift/row values are the ones the procedural
+# puffs used, so the motion on screen is unchanged.
+CLOUD_SLOT = (172, 98)              # game-size cloud, aspect-preserved
+CLOUD_CROP_ALPHA = 240              # below this a pixel is key bleed, not cloud body
+CROP_KEYS = ("cloud",)              # assets cropped to their opaque body before scaling
+CLOUD_ROWS = (0.10, 0.183, 0.266)   # cloud centre y as fractions of screen height
+CLOUD_SPEED = 0.55                  # px/frame horizontal drift
+CLOUD_SPACING = 0.357               # phase offset between clouds, fraction of width
+
 SPRITE_TARGETS = {
     "cat_idle": (54, 54),
     "cat_tail": (53, 46),      # same scale as cat_idle (canvas 1008x864 -> 53x46)
@@ -45,6 +57,7 @@ SPRITE_TARGETS = {
     "supercat": (300, 260),
     "debris_wood": (18, 18),
     "debris_stone": (18, 18),
+    "cloud": CLOUD_SLOT,       # cropped to the cloud body, so its slot is that aspect
 }
 
 # Art nothing blits today, kept OUT of SPRITE_TARGETS so startup never pays its
@@ -65,6 +78,7 @@ MOUSE_PLATE = "mouse_large"   # mouse_small/medium are byte-identical copies
 # are NOT display-converted -- only the game-size copies load_assets hands out
 # ever go through _finish, which is also why they cannot be blitted fast.
 _MATTED = {}                  # name -> un-converted SRCALPHA Surface at canvas size
+_CROPPED = {}                 # name -> RAW crop of _MATTED[name] to its opaque body
 _STRIPS = {}                  # (material, height, theme_idx) -> RAW (pre-_finish) crop
                               # tinted full-width crop; each Renderer converts its own
                               # display copy (Renderer.strip_display) once, so the
@@ -150,6 +164,28 @@ def matted_surface(name):
         surf = rgba_to_surface(rgb, alpha)
         _MATTED[name] = surf
     return surf
+
+
+def crop_to_opaque(name):
+    """Matted canvas cropped tightly to its opaque body.
+
+    Key residue can reach every canvas edge, so an alpha > 0 bbox would crop nothing;
+    the threshold is CLOUD_CROP_ALPHA (see CROP_KEYS), which keeps only real subject
+    pixels. Cached per name, so the crop happens once per process, not per Renderer.
+    """
+    out = _CROPPED.get(name)
+    if out is None:
+        surf = matted_surface(name)
+        al = pygame.surfarray.pixels_alpha(surf).transpose(1, 0)   # [y][x]
+        solid = al >= CLOUD_CROP_ALPHA
+        ys, xs = np.nonzero(solid)
+        if len(xs) == 0:
+            _CROPPED[name] = surf.copy()
+        else:
+            rect = pygame.Rect(int(xs.min()), int(ys.min()),
+                               int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
+            _CROPPED[name] = surf.subsurface(rect).copy()
+    return _CROPPED[name]
 
 
 def clean_scale(img, size):
@@ -288,6 +324,19 @@ def _scaled(size, name=None):
     return (max(1, int(round(size[0] * f))), max(1, int(round(size[1] * f))))
 
 
+def cloud_positions(width, height, frame_count):
+    """Centres of the three drifting clouds, as (x, y) screen coordinates.
+
+    Shared by `renderer.draw_background` and the tests so both assert the same maths.
+    The wrap band spans width + 2*half-slot, offset by -half, so a cloud slides fully
+    off one edge before reappearing at the other instead of popping mid-screen.
+    """
+    half = _scaled(CLOUD_SLOT, "cloud")[0] // 2
+    span = width + 2 * half
+    return [(int((frame_count * CLOUD_SPEED + ci * width * CLOUD_SPACING) % span - half),
+             int(height * frac)) for ci, frac in enumerate(CLOUD_ROWS)]
+
+
 def load_assets(width, height):
     """Every asset a Renderer needs, as Surfaces at their exact game sizes.
 
@@ -297,7 +346,8 @@ def load_assets(width, height):
     assets = {}
     raw = {}
     for name, size in SPRITE_TARGETS.items():
-        raw[name] = clean_scale(matted_surface(name), _scaled(size, name))
+        src = crop_to_opaque(name) if name in CROP_KEYS else matted_surface(name)
+        raw[name] = clean_scale(src, _scaled(size, name))
         assets[name] = _finish(raw[name])
     # kept as a key so callers can find it, but blank until something materializes
     for name, size in LAZY_SPRITES.items():

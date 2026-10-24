@@ -118,15 +118,18 @@ class Renderer:
         # all within reach of the procedural disc at (W*0.785, H*0.133) -> not redrawn.
         # Hills, trees and the grass band are baked into the plate too.
 
-        # Clouds stay procedural: no plate has a near-white cloud shape (0 px >= 245
-        # lum in the sky band) and the theme cloud is 45..101 lum over that band.
-        fx = self.W / 1920.0
-        for ci in range(3):
-            cx = (frame_count * 0.55 + ci * (self.W * 0.357)) % (self.W + int(274 * fx)) - int(137 * fx)
-            cy = self.H * (0.1 + ci * 0.083)
-            pygame.draw.circle(self.surf, theme["cloud"], (int(cx), int(cy)), 54)
-            pygame.draw.circle(self.surf, theme["cloud"], (int(cx + 34), int(cy - 9)), 45)
-            pygame.draw.circle(self.surf, theme["cloud"], (int(cx + 69), int(cy)), 50)
+        # Clouds are cloud.png -- matted and cropped to its cloud body at load time,
+        # then tinted per theme like every other sprite. Positions and drift come from
+        # renderer_assets.cloud_positions so the tests assert the same maths as the blit.
+        cloud = self.assets.get(f"cloud@{self.theme_idx}") or self.assets.get("cloud")
+        if cloud is not None:
+            cw, ch = cloud.get_size()
+            half_w, half_h = cw // 2, ch // 2
+            for cx, cy in renderer_assets.cloud_positions(self.W, self.H, frame_count):
+                left, top = int(cx - half_w), int(cy - half_h)
+                if left >= self.W or left + cw <= 0:
+                    continue          # fully off-screen this frame
+                self.surf.blit(cloud, (left, top))
 
     def _paint_bg_gap(self, idx, off, plate):
         """Paint the screen rows a (W,H) plate misses when it is blitted at `off`.
