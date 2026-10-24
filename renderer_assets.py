@@ -1,8 +1,9 @@
 """Phase 3 asset loading: magenta-key matting once per plate, game-size Surfaces.
 
-Semantics copied from `.superpowers/brainstorm/compositor.py` (`matte_from_key` ->
-premultiply -> `smoothscale` -> un-premultiply with the alpha clamp). The DEAD
-`load_clean` there is NOT reproduced: every sprite goes through the matte step.
+Semantics copied from the Phase 3 brainstorm scratch compositor (a throwaway script, now
+deleted): `matte_from_key` -> premultiply -> `smoothscale` -> un-premultiply with the alpha
+clamp. The dead `load_clean` in that script is NOT reproduced: every sprite goes through the
+matte step.
 Plates and strips are read with Pillow so no source PNG dimension is ever
 hardcoded -- widths/heights come from the decoded array.
 """
@@ -14,7 +15,7 @@ import numpy as np
 import pygame
 from PIL import Image
 
-# matte constants (compositor.py)
+# matte constants, derived from the brainstorm compositor (script since deleted)
 KEY_FEATHER_LO = 36.0     # L1 at/below this -> fully transparent (pure key)
 KEY_FEATHER_HI = 150.0    # L1 at/above this -> fully opaque; between -> ramp
 DESPILL_MARGIN = 90.0     # how far past KEY_FEATHER_HI despill weight stays > 0
@@ -24,6 +25,12 @@ EXT_RADIUS = 3            # radius of opaque-colour extension into the feather b
 TINT = {0: (1.0, 30), 1: (0.8221, 60), 2: (0.25, 30), 3: (0.644, 60)}
 
 BG_PLATES = ("bg_daytime", "bg_sunset", "bg_night", "bg_twilight")
+
+# The main-menu backdrop, generated in ComfyUI from the prompt in
+# .superpowers/brainstorm/regen-prompts-v4-menu-plate.md (dusk sky, no letterbox
+# bars). It is not one of the four theme plates and is never tinted: `load_assets`
+# smooths it to the display size once and `draw_menu` blits it full-screen.
+MENU_PLATE = "bg_menu"
 # v3 plates (regenerated 2026-10-23 with the lawn pinned to the game floor): the
 # rule is no longer "land the plate's ground line on ground_y = H - 180". It is now
 # "the plate's unbroken lawn band must COVER ground_y with margin, and the plate
@@ -63,7 +70,10 @@ SPRITE_TARGETS = {
 # Art nothing blits today, kept OUT of SPRITE_TARGETS so startup never pays its
 # matte: handed out blank at the exact game size and matted on demand by
 # `LazySprite.materialize()` (particles stayed procedural -- Phase 2 ruling).
-LAZY_SPRITES = {"dust_puff": (48, 48)}
+# Empty since cleanup 2026-10-24: dust_puff.png was the only entry, it is 265 KB
+# of art that no draw_* call ever blitted, so the plate is gone from the repo and
+# the EXE. The mechanism stays here for the next plate that ships unused.
+LAZY_SPRITES = {}
 
 MOUSE_SIZES = {"mouse_small": (44, 36), "mouse_medium": (58, 48), "mouse_large": (80, 66)}
 MOUSE_KEYS_BY_RADIUS = {22: "mouse_small", 29: "mouse_medium", 40: "mouse_large"}
@@ -83,6 +93,12 @@ _STRIPS = {}                  # (material, height, theme_idx) -> RAW (pre-_finis
                               # tinted full-width crop; each Renderer converts its own
                               # display copy (Renderer.strip_display) once, so the
                               # first Renderer to run cannot fix the pixel format.
+_PLATES = {}                  # (name, width, height) -> FINISHED backdrop plate
+                              # (theme plates + MENU_PLATE). Backdrops are read and
+                              # smoothscaled once per size for the whole process, so
+                              # a second Renderer -- or a test calling load_assets
+                              # twice -- gets the SAME Surface instead of paying the
+                              # PNG decode and rescale again.
 
 
 def _asset_path(name):
@@ -218,12 +234,14 @@ def clean_scale(img, size):
 class LazySprite(pygame.Surface):
     """Game-size Surface whose art is built the first time `.materialize()` runs.
 
-    Keys in `LAZY_SPRITES` go through this instead of SPRITE_TARGETS, so a plate
-    nothing blits never pays its ~50 ms matte at startup. It IS a pygame.Surface
-    (subclass) and is blank/fully transparent until materialized -- anything that
-    ever wants to draw it must call `assets[key].materialize()` first, which
-    fills this same surface in place and returns it for the caller to `_finish`.
-    No tinted `key@idx` variants are made for lazy keys while nothing reads them.
+    Kept for the day a plate ships that nothing blits yet: keys in `LAZY_SPRITES`
+    would go through this instead of SPRITE_TARGETS, so such a plate never pays its
+    ~50 ms matte at startup. It IS a pygame.Surface (subclass) and is blank/fully
+    transparent until materialized -- anything that ever wants to draw it must call
+    `assets[key].materialize()` first, which fills this same surface in place and
+    returns it for the caller to `_finish`. No tinted `key@idx` variants are made
+    for lazy keys while nothing reads them. `LAZY_SPRITES` is empty today, so no
+    key goes through here.
     """
     def __init__(self, size, source):
         super().__init__(size, pygame.SRCALPHA)
@@ -352,7 +370,8 @@ def load_assets(width, height):
     # kept as a key so callers can find it, but blank until something materializes
     for name, size in LAZY_SPRITES.items():
         assets[name] = LazySprite(_scaled(size, name), name)
-    # one mouse plate serves three sizes
+    # one mouse plate serves three sizes; mouse_small.png / mouse_medium.png were
+    # byte-identical copies of it and are gone from the repo
     for key, size in MOUSE_SIZES.items():
         if key == MOUSE_PLATE:
             continue
@@ -376,9 +395,16 @@ def load_assets(width, height):
             tint_surface(fork_big, mult, lift))
         assets[f"cat_tail_rot@{idx}"] = _tail_table(tint_surface(raw["cat_tail"], mult, lift))
 
-    for i, name in enumerate(BG_PLATES):
-        plate = _plate_surface(name)
-        assets[name] = _finish(pygame.transform.smoothscale(plate, (width, height)))
+    # Backdrops (theme plates + the menu plate) are decoded and smoothscaled ONCE
+    # per size and cached, so repeated load_assets calls hand back the same Surface.
+    for name in list(BG_PLATES) + [MENU_PLATE]:
+        key = (name, width, height)
+        plate = _PLATES.get(key)
+        if plate is None:
+            plate = _finish(pygame.transform.smoothscale(
+                _plate_surface(name), (width, height)))
+            _PLATES[key] = plate
+        assets[name] = plate
 
     cat_idle = raw["cat_idle"]
     raw["cat_idle_big"] = pygame.transform.smoothscale(cat_idle, (108, 108))

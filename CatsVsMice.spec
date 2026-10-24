@@ -23,6 +23,7 @@ exe = EXE(
     a.datas,
     [],
     name='CatsVsMice',
+    icon='assets/generated/icon.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

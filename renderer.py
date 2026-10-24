@@ -478,7 +478,13 @@ class Renderer:
             pygame.draw.circle(self.surf, (255, 255, 0), (px, py), 7)
 
     def draw_menu(self, frame):
-        self.surf.fill((30, 30, 50))
+        # The user-generated menu plate covers the whole screen; the flat fill is
+        # only the fallback when the asset is missing (e.g. a build without assets).
+        plate = self.assets.get(renderer_assets.MENU_PLATE)
+        if plate is not None:
+            self.surf.blit(plate, (0, 0))
+        else:
+            self.surf.fill((30, 30, 50))
         font = pygame.font.SysFont("Arial", 86, bold=True)
         txt = font.render("CATS vs MICE", True, (255, 200, 50))
         text_x = (self.W - txt.get_width()) // 2
