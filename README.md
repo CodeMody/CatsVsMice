@@ -1,7 +1,7 @@
 
 # Cats vs Mice
 
-A physics-based projectile game built with **Python 3.12** and **pygame**, inspired by the classic slingshot-launch genre. Launch cats from a slingshot to knock out mice hidden inside destructible structures. The game features 50 procedurally generated levels, milestones, challenge levels, high-score leaderboards, and procedural audio — graphics are pre-baked PNG assets generated with ComfyUI (`moss-image-sft`, one seed for the whole set) and shipped from `assets/generated/` inside the build, while audio needs no files beyond a single optional background music file.
+A physics-based projectile game built with **Python 3.12** and **pygame**, inspired by the classic slingshot-launch genre. Launch cats from a slingshot to knock out mice hidden inside destructible structures. The game features 50 procedurally generated levels, milestones, challenge levels, high-score leaderboards, and procedural audio — graphics are pre-baked PNG assets generated with ComfyUI (`moss-image-sft`, one seed for the whole set) and shipped from `assets/generated/` inside the build, while audio needs no files beyond a single optional background music file. Runs from source on any platform pygame supports; the checked-in spec builds a standalone **Windows** EXE (see [Building for Linux](#linux-build)).
 
 ---
 
@@ -19,8 +19,9 @@ A physics-based projectile game built with **Python 3.12** and **pygame**, inspi
 10. [Rendering & Themes](#rendering--themes)
 11. [Testing](#testing)
 12. [Building a Standalone EXE](#StandaloneExe)
-13. [Installation & Running](#installation--running)
-14. [Controls](#controls)
+13. [Building for Linux](#linux-build)
+14. [Installation & Running](#installation--running)
+15. [Controls](#controls)
 
 ---
 
@@ -31,7 +32,7 @@ A physics-based projectile game built with **Python 3.12** and **pygame**, inspi
 - **Resolution:** 1920 × 1080 (UI scales to the actual display surface)
 - **Frame rate:** 60 FPS fixed timestep
 - **Levels:** 50 (deterministic procedural generation)
-- **Dependencies:** `pygame` (plus the Python standard library only)
+- **Dependencies:** `pygame` and `Pillow` (`renderer_assets.py` decodes the PNG plates with Pillow; PyInstaller picks it up automatically), plus the Python standard library
 
 ---
 
@@ -61,6 +62,24 @@ A physics-based projectile game built with **Python 3.12** and **pygame**, inspi
 ## Architecture / Project Structure
 
 **Dependency graph (imports):**
+
+```
+main.py ──► game.py ──► entities.py, physics.py, level_generator.py, high_scores.py
+   │           │
+   │           └──────► renderer.py ──► renderer_assets.py   (leaf: pygame + numpy + Pillow)
+   │                        │
+   │                        └──► physics.py  (trajectory_preview, imported inside draw_trajectory)
+   ├──► renderer.py
+   ├──► audio.py        (standalone: stdlib only)
+   └──► high_scores.py
+
+tests.py ───────► physics, level_generator, game, high_scores, entities
+tests_assets.py ─► entities, level_generator, renderer, renderer_assets
+tools/make_icon.py ► renderer_assets  (build-time only, not bundled in the EXE)
+```
+
+`renderer_assets.py` imports nothing from this project, so it is the seam everything else
+can be tested through: plates are decoded once, matted, cached, and handed out as Surfaces.
 
 ---
 
@@ -105,7 +124,7 @@ Standalone constants and pure functions (fully testable):
 Helpers: `_surface_clear`, `_pick_free_ground_x`, `_pick_mouse_size`.
 
 ### `renderer.py` — Rendering
-`Renderer` is asset-first: it blits pre-baked PNG plates from `assets/generated/` (loaded and cached once by `renderer_assets.py`, which also downscales every sprite to its game size at load time) and paints only the procedural parts on top. Four theme palettes (`THEMES`) cycle by level via `get_theme()`: Daytime, Sunset, Night, Twilight — the matching full-screen background plate cycles with them every 5 levels. Provides drawing routines for backgrounds (blitted plate plus three drifting cloud sprites and twinkling stars; sun/moon, hills, trees and grass are baked into the plate), slingshot, cat, mice, blocks, particles, debris, trajectory, HUD, menu, scoreboard, completion, game-over, victory, and the milestone "SuperCat" animation.
+`Renderer` is asset-first: it blits pre-baked PNG plates from `assets/generated/` (loaded and cached once by `renderer_assets.py`, which also downscales every sprite to its game size at load time) and paints only the procedural parts on top. Four theme palettes (`THEMES`) cycle by level via `get_theme()`: Daytime, Sunset, Night, Twilight — the matching full-screen background plate cycles with them every 5 levels. Provides drawing routines for backgrounds (blitted plate plus three drifting cloud sprites and twinkling stars; sun/moon, hills, trees and grass are baked into the plate), slingshot, cat, mice, blocks, particles, debris, trajectory, HUD, menu (blitted `bg_menu` plate), scoreboard, completion, game-over, victory, and the milestone "SuperCat" animation.
 
 ### `audio.py` — Procedural audio
 Generates all sound effects at runtime as WAV bytes (`generate_sound`) — no audio asset files required. Provides `meow`, `thud`, `crunch`, `squeak`, `whoosh`, `ouch`. Background music is loaded from `assets/ambient_loop.wav` if present. `AudioManager` singleton exposes `ensure_ready()` (must be called after `pygame.init()`), `play(name)`, `set_volume(v)`, `get_volume()`. All audio failures are swallowed so audio never crashes the game.
@@ -165,13 +184,20 @@ All SFX are procedurally synthesized (sine/envelope math → WAV bytes) and load
 
 ## Rendering & Themes
 
-Graphics are pre-baked PNG assets in `assets/generated/` — generated with ComfyUI (`moss-image-sft`, one seed for the whole set) — not pygame primitives. Sprites are keyed on a flat magenta backdrop and matted at load time (despill + feather, with an alpha clamp); each theme applies a multiply tint (×1.0 / ×0.8221 / ×0.25 / ×0.644) plus an additive grey lift; background plates are 1920×1072 full-bleed art blitted at their native aspect (the per-theme vertical offsets are now all zero) so each plate's unbroken lawn band covers the game floor at `H - 180` with margin; `cat_tail.png` is a separate sprite driven by a load-time rotation table whose twelve wag frames are pinned at the tail stroke's base end (that end and the plate's symmetry are chosen at load time, so a re-rolled plate stays attached however its art is oriented), anchored at mid-rump height via the `TAIL_ANCHOR` knob in `renderer_assets.py`; `cloud.png` is cropped to its cloud body (key residue reaches every canvas edge, so an alpha > 0 crop would cut nothing) and matted at load time, then blitted as three drifting clouds whose slot keeps the plate's aspect — the drift/row values are the ones the old procedural circles used, so the motion is unchanged; no contact shadow is drawn under sprites. Particles, trajectory, HUD and menus stay procedural. Four themes cycle every 5 levels: Daytime → Sunset → Night → Twilight. Night/Twilight add twinkling stars. UI scales to the real display surface.
+Graphics are pre-baked PNG assets in `assets/generated/` — generated with ComfyUI (`moss-image-sft`, one seed for the whole set) — not pygame primitives. Sprites are keyed on a flat magenta backdrop and matted at load time (despill + feather, with an alpha clamp); each theme applies a multiply tint (×1.0 / ×0.8221 / ×0.25 / ×0.644) plus an additive grey lift; background plates are 1920×1072 full-bleed art blitted at their native aspect (the per-theme vertical offsets are now all zero) so each plate's unbroken lawn band covers the game floor at `H - 180` with margin; the main menu has its own plate, `bg_menu.png` — a dusk sky generated from the prompt document `.superpowers/brainstorm/regen-prompts-v4-menu-plate.md`, loaded once at display size and cached process-wide, so a second Renderer gets the same Surface instead of re-decoding it. It is never tinted: `draw_menu` blits it full-screen and paints the amber title and grey button rects straight onto it (no scrim, and the plate was rolled so both UI bands hold no foreground art); the flat navy fill survives only as the fallback when the asset is missing. All three mouse sizes come from the single `mouse_large.png` plate scaled to each slot (`mouse_small.png` / `mouse_medium.png` were byte-identical copies and are gone); `cat_tail.png` is a separate sprite driven by a load-time rotation table whose twelve wag frames are pinned at the tail stroke's base end (that end and the plate's symmetry are chosen at load time, so a re-rolled plate stays attached however its art is oriented), anchored at mid-rump height via the `TAIL_ANCHOR` knob in `renderer_assets.py`; `cloud.png` is cropped to its cloud body (key residue reaches every canvas edge, so an alpha > 0 crop would cut nothing) and matted at load time, then blitted as three drifting clouds whose slot keeps the plate's aspect — the drift/row values are the ones the old procedural circles used, so the motion is unchanged; no contact shadow is drawn under sprites. Particles, trajectory, HUD and the menu's widgets stay procedural. Four themes cycle every 5 levels: Daytime → Sunset → Night → Twilight. Night/Twilight add twinkling stars. UI scales to the real display surface.
 
 ---
 
 ## Testing
 
 Run the test suite to validate core logic:
+
+```powershell
+python tests.py         # physics, collisions, level generation, scoring, high scores
+python tests_assets.py  # asset loader: matting, sizes, caching, strips, clouds, icon, menu plate
+```
+
+The runner reports `PASS`/`FAIL` per test and exits `0` on success (`tests.py`: 18 tests, `tests_assets.py`: 22). Both run headless via pygame's `dummy` SDL driver, so no window is needed. `tests_assets.py` saves one eyeball frame to a scratch folder **outside** the repo (`<temp>/cats-vs-mice-preview/frame_playing.png`) — running the tests leaves no artifacts in the project.
 
 The runner reports `PASS`/`FAIL` per test and exits `0` on success.
 
@@ -186,9 +212,10 @@ The game is compiled into a single-file Windows executable using **PyInstaller**
 
 | Path | Description |
 |------|-------------|
-| `CatsVsMice.spec` | PyInstaller build specification: entry point `main.py`, bundles the whole `assets/` folder as a data directory (`datas=[('assets', 'assets')]` — recursive, so every PNG under `assets/generated/` ships automatically and no per-file entries are needed), UPX-compressed, windowed (no console), single-file output that unpacks into PyInstaller's temporary `_MEIPASS` folder at launch |
+| `CatsVsMice.spec` | PyInstaller build specification: entry point `main.py`, bundles the whole `assets/` folder as a data directory (`datas=[('assets', 'assets')]` — recursive, so every PNG under `assets/generated/` ships automatically and no per-file entries are needed), embeds `assets/generated/icon.ico` as the EXE's Windows icon (`icon=`), UPX-compressed, windowed (no console), single-file output that unpacks into PyInstaller's temporary `_MEIPASS` folder at launch |
+| `tools/make_icon.py` | Build-time tool, not shipped in the EXE: crops `cat_idle.png` to its face — anchored on the measured green-eye band, ear tips to chin — composites it on the daytime plate's own sky gradient with rounded corners, and packs 16/32/48/256 PNG-compressed frames into `assets/generated/icon.ico`. Re-run it after re-rolling `cat_idle.png`: `python tools/make_icon.py` |
 | `renderer_assets.py` | Asset loader/cache imported transitively (`main.py` → `renderer.py` → `renderer_assets.py`): reads the PNGs from `assets/generated/`, mattes and downscales them once per process, and resolves paths through `sys._MEIPASS` when running frozen |
-| `assets/generated/` | The 16 pre-baked PNG plates/sprites generated with ComfyUI (`moss-image-sft`, one seed for the whole set); bundled as data by the spec and shipped inside the single-file EXE (`mouse_small/medium/large.png` are byte-identical copies kept separate so all three loader keys resolve) |
+| `assets/generated/` | The 15 pre-baked PNG plates/sprites generated with ComfyUI (`moss-image-sft`, one seed for the whole set), including the menu backdrop `bg_menu.png`, plus `icon.ico` built by `tools/make_icon.py`; bundled as data by the spec and shipped inside the single-file EXE. All three mouse sizes scale from the one `mouse_large.png` plate |
 | `build/` | Intermediate compilation artifacts produced by PyInstaller (safe to delete; regenerated on each build) |
 | `dist/CatsVsMice.exe` | The final standalone game — pygame and all project modules are bundled inside; no Python installation needed to run it |
 
@@ -196,13 +223,54 @@ The game is compiled into a single-file Windows executable using **PyInstaller**
 
 Or from scratch (equivalent to the spec):
 
+```powershell
+pip install pyinstaller               # build-time only; the game itself needs pygame + Pillow
+python tools/make_icon.py             # regenerate assets/generated/icon.ico if cat_idle.png was re-rolled
+pyinstaller CatsVsMice.spec --noconfirm
+```
+
 ### Running the compiled game
 
-Double-click `dist\CatsVsMice.exe` or run it from a terminal:powershell .\dist\CatsVsMice.exe
+Double-click `dist\CatsVsMice.exe` or run it from a terminal:
+
+```powershell
+.\dist\CatsVsMice.exe
+```
+
+## Building for Linux
+
+<a id="linux-build"></a>
+
+The game is pure Python plus pygame, so it runs on Linux unchanged:
+
+```bash
+pip install pygame          # Pillow is needed too -- renderer_assets.py decodes PNGs with it
+python3 main.py
+```
+
+To compile a standalone Linux binary, use the same spec file (it carries no Windows-only
+paths; `assets/` and `icon=` resolve the same way):
+
+```bash
+python3 -m pip install pyinstaller pillow pygame
+python3 tools/make_icon.py            # optional: rebuild assets/generated/icon.ico
+pyinstaller CatsVsMice.spec --noconfirm
+./dist/CatsVsMice                     # PyInstaller names the output after the entry point, not ".exe"
+```
+
+Three caveats worth knowing before shipping it to someone else's machine:
+
+- **glibc:** PyInstaller bundles CPython and SDL but links against the *build host's* libc,
+  so a binary built on a very new distro can fail on an older one with a `GLIBC_2.xx not found`
+  error. Build on the same distro family the player uses — building on their machine is safest.
+- **System libs:** pygame needs SDL2 present (`libsdl2-dev` on Debian/Ubuntu); PyInstaller does
+  not install it for you.
+- **The icon:** `assets/generated/icon.ico` is a Windows icon format. On Linux it is a data
+  file only — window/taskbar icons come from the desktop environment, not the binary.
 
 ## Installation & Running
 
-Requires **Python 3.12** and **pygame**. A virtual environment (`.venv`) is configured in the project.
+Requires **Python 3.12**, **pygame** and **Pillow** (`pip install pygame Pillow`). A virtual environment (`.venv`) is configured in the project; start it with `python main.py`. On Linux, see [Building for Linux](#linux-build).
 
 ---
 

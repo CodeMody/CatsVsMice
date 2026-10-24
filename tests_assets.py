@@ -3,19 +3,24 @@ by `renderer.Renderer`. Same plain-assert style as tests.py: each `test_*` runs
 through `run_tests()` and `python tests_assets.py` exits non-zero on failure."""
 import math
 import os
+import re
 import shutil
+import struct
 import sys
 import tempfile
 
 import numpy as np
 import pygame
+from PIL import Image
 
 import entities
 import level_generator
 import renderer as renderer_mod
 import renderer_assets
 
-PREVIEW_DIR = os.path.join(".superpowers", "brainstorm", "preview")
+# Scratch frames the suite saves for eyeballing. OUTSIDE the project on purpose:
+# running the tests must not leave a folder of PNGs in the repo or in the EXE.
+PREVIEW_DIR = os.path.join(tempfile.gettempdir(), "cats-vs-mice-preview")
 
 
 def test_asset_paths_resolve():
@@ -63,7 +68,6 @@ def test_loader_returns_surfaces():
         "supercat": (300, 260),
         "debris_wood": (18, 18),
         "debris_stone": (18, 18),
-        "dust_puff": (48, 48),
     }
     # the playtest-driven ruling: cats + mice at 1.5x, everything else back at 1x
     assert renderer_assets.CAT_SCALE == 1.5, f"CAT_SCALE {renderer_assets.CAT_SCALE}"
@@ -73,7 +77,7 @@ def test_loader_returns_surfaces():
         assert renderer_assets.SCALE_OVERRIDES[key] == 1.5, f"{key} not 1.5x"
     for key in ("mouse_small", "mouse_medium", "mouse_large"):
         assert renderer_assets.SCALE_OVERRIDES[key] == 1.5, f"{key} not 1.5x"
-    for key in ("sling_fork", "debris_wood", "debris_stone", "dust_puff"):
+    for key in ("sling_fork", "debris_wood", "debris_stone"):
         got = renderer_assets.SCALE_OVERRIDES.get(key, renderer_assets.SPRITE_SCALE)
         assert got == 1, f"{key} should be back at 1x, is {got}x"
     expected = {k: renderer_assets._scaled(v, k) for k, v in game_slot.items()}
@@ -147,6 +151,7 @@ def test_headless_frame():
         rend.draw_block(block)
     rend.draw_hud(1234, 1, 2, frame)
 
+    os.makedirs(PREVIEW_DIR, exist_ok=True)
     assert os.path.isdir(PREVIEW_DIR), f"no preview dir: {PREVIEW_DIR}"
     out = os.path.join(PREVIEW_DIR, "frame_playing.png")
     pygame.image.save(screen, out)
@@ -375,6 +380,204 @@ def test_background_blits_the_cloud_plate():
     assert checked == 3, f"only {checked} clouds checked"
 
 
+def _ico_frames(path):
+    """Decode an ICO container ourselves: header + 16-byte directory entries + payloads.
+
+    `tools/make_icon.py` writes PNG-compressed frames, so each payload is a whole PNG;
+    decoding here keeps the test independent of Pillow's ICO reader.
+    """
+    from io import BytesIO
+    from PIL import Image
+    data = open(path, "rb").read()
+    reserved, rtype, count = struct.unpack("<HHH", data[:6])
+    assert reserved == 0 and rtype == 1, f"not an ICO container: reserved={reserved} type={rtype}"
+    frames = {}
+    for i in range(count):
+        ent = data[6 + i * 16: 6 + i * 16 + 16]
+        w, h = struct.unpack("<BB", ent[:2])
+        bpp = struct.unpack("<H", ent[6:8])[0]
+        size, off = struct.unpack("<II", ent[8:16])
+        side = w or 256, h or 256
+        assert side[0] == side[1], f"icon frame {side} is not square"
+        assert bpp == 32, f"icon frame {side} has {bpp} bpp, needs 32 for rounded corners"
+        payload = data[off: off + size]
+        assert payload[:8] == b"\x89PNG\r\n\x1a\n", f"icon frame {side} is not a PNG payload"
+        img = Image.open(BytesIO(payload)).convert("RGBA")
+        assert img.size == side, f"icon frame declares {side} but decodes to {img.size}"
+        frames[side] = img
+    return frames
+
+
+def test_icon_asset_ships_the_sizes_windows_needs():
+    """`assets/generated/icon.ico` must carry 16/32/48/256 at 32 bpp."""
+    path = renderer_assets._asset_path("icon.ico")
+    assert os.path.exists(path), f"no icon asset at {path}"
+    frames = _ico_frames(path)
+    assert set(frames) == {(16, 16), (32, 32), (48, 48), (256, 256)}, \
+        f"icon sizes {sorted(frames)} != 16/32/48/256"
+
+
+def test_icon_crop_is_the_face_not_the_whole_body():
+    """The crop is a square around the face: it contains both eyes and stops above
+    the paws, so the tile reads as a cat FACE rather than a smudged whole cat."""
+    import tools.make_icon as make_icon
+    crop = make_icon.face_crop()
+    al = pygame.surfarray.array_alpha(crop).transpose(1, 0)          # [y][x]
+    rgb = pygame.surfarray.array3d(crop).transpose(1, 0, 2).astype(np.int32)
+    solid = al >= 240
+    assert crop.get_width() == crop.get_height(), f"face crop {crop.get_size()} is not square"
+
+    green = (rgb[..., 1] > rgb[..., 0] + 30) & (rgb[..., 1] > rgb[..., 2] + 20) & solid
+    cols = np.nonzero(green.any(axis=0))[0]
+    assert len(cols) > 0, "the crop holds no green eyes -- it is not the face"
+    span = cols.max() - cols.min() + 1
+    assert span > crop.get_width() * 0.25, f"eyes fill only {span}/{crop.get_width()} of the tile"
+
+    ys, xs = np.nonzero(solid)
+    body = renderer_assets.matted_surface("cat_idle")
+    bal = pygame.surfarray.pixels_alpha(body).transpose(1, 0)
+    bsolid = bal >= 240
+    bys, bxs = np.nonzero(bsolid)
+    body_h = bys.max() - bys.min() + 1
+    # the crop must be a fraction of the body and must stop short of the paw band
+    assert crop.get_width() < bxs.max() - bxs.min() + 1, "crop is as wide as the whole cat"
+    assert ys.max() <= bys.max() - int(0.10 * body_h), \
+        f"crop reaches y {ys.max()}, inside the paw band (body bottom {bys.max()})"
+
+
+def test_icon_tile_is_a_rounded_tile_on_daytime_sky():
+    """Backdrop comes from the daytime plate's own sky; corners are transparent so
+    Explorer shows a rounded tile, and the face covers most of it."""
+    import tools.make_icon as make_icon
+    tile = make_icon.tile_master(256)
+    arr = np.asarray(tile)                                    # [y][x][4]
+    assert arr.shape[:2] == (256, 256), f"tile {arr.shape[:2]} != 256x256"
+    assert arr[0, 0, 3] == 0 and arr[0, -1, 3] == 0 and arr[-1, 0, 3] == 0 and arr[-1, -1, 3] == 0, \
+        "tile corners are not transparent"
+    assert arr[128, 0, 3] == 255 and arr[0, 128, 3] == 255, "tile edge midpoints are cut away"
+
+    plate = renderer_assets._plate_surface("bg_daytime")
+    pa = pygame.surfarray.array3d(plate).transpose(1, 0, 2)    # [y][x][3]
+    sky_top = pa[4, pa.shape[1] // 2]
+    sky_low = pa[int(pa.shape[0] * 0.30), pa.shape[1] // 2]
+    # the face crop is inset, so the outer margin is pure sky: check both ends of the
+    # gradient against the plate's own sampled rows
+    band = arr[:12, :, :3]
+    assert int(np.abs(band.astype(np.int32) - sky_top[None, None, :]).mean()) < 30, \
+        f"tile top {tuple(band.mean(axis=(0, 1)))} is not the plate's sky ({tuple(sky_top)})"
+    low = arr[-12:, :, :3]
+    assert int(np.abs(low.astype(np.int32) - sky_low[None, None, :]).mean()) < 30, \
+        f"tile bottom {tuple(low.mean(axis=(0, 1)))} is not the plate's sky ({tuple(sky_low)})"
+
+    # fur is identified by colour, not alpha: the sky margin is fully opaque too
+    grad = np.round(sky_top[None, :] * (1.0 - np.linspace(0.0, 1.0, 256)[:, None])
+                   + sky_low[None, :] * np.linspace(0.0, 1.0, 256)[:, None])
+    away = np.abs(arr[..., :3].astype(np.int32) - grad[:, None, :]).mean(axis=2)
+    fur = (arr[..., 3] >= 240) & (away > 30)
+    assert int(fur.sum()) > 256 * 256 * 0.45, f"face covers only {int(fur.sum())} of 65536 px"
+    crop = make_icon.face_crop()
+    side_face = int(round(256 * make_icon.FACE_FILL))
+    scaled = renderer_assets.clean_scale(crop, (side_face, side_face))
+    src = pygame.surfarray.array3d(scaled).transpose(1, 0, 2).astype(np.int32)
+    sa = pygame.surfarray.array_alpha(scaled).transpose(1, 0)
+    tile_mean = arr[..., :3][fur].astype(np.int32).mean(axis=0)
+    crop_mean = src[sa == 255].mean(axis=0)
+    drift = float(np.abs(tile_mean - crop_mean).max())
+    assert drift < 12, f"tile fur colour drifts from the plate: max channel diff {drift:.1f}"
+
+
+def test_shipped_icon_matches_the_tool_output():
+    """The committed .ico must be what `tools/make_icon.py` produces, frame for frame."""
+    import tools.make_icon as make_icon
+    path = renderer_assets._asset_path("icon.ico")
+    frames = _ico_frames(path)
+    sizes = sorted(frames)
+    master = make_icon.tile_master(max(sizes)[0])
+    for side, img in frames.items():
+        want = np.asarray(master.resize(side, Image.LANCZOS))
+        got = np.asarray(img)
+        assert got.shape == want.shape, f"{side} frame shape {got.shape} != {want.shape}"
+        diff = float(np.abs(got.astype(np.int32) - want.astype(np.int32)).mean())
+        assert diff == 0.0, f"{side} frame differs from the tool output by mean L1 {diff}"
+
+
+def test_spec_points_at_the_icon_asset():
+    """PyInstaller must embed the icon, otherwise the EXE shows pygame's default."""
+    spec = open(os.path.join(os.path.dirname(renderer_assets.__file__), "CatsVsMice.spec"),
+                encoding="utf-8").read()
+    m = re.search(r"icon\s*=\s*['\"]([^'\"]+)['\"]", spec)
+    assert m, "CatsVsMice.spec has no icon= field"
+    target = os.path.normpath(os.path.join(os.path.dirname(renderer_assets.__file__), m.group(1)))
+    assert os.path.exists(target), f"spec icon points at a missing file: {target}"
+
+
+def test_menu_plate_loaded_once_at_display_size():
+    """`load_assets` hands out the menu plate at the display size, like the theme plates."""
+    width, height = 1920, 1080
+    assets = renderer_assets.load_assets(width, height)
+    key = renderer_assets.MENU_PLATE
+    assert key in assets, f"missing asset key: {key}"
+    surf = assets[key]
+    assert isinstance(surf, pygame.Surface), f"{key} is not a Surface"
+    assert surf.get_size() == (width, height), f"{key} is {surf.get_size()} != {(width, height)}"
+    assert len(surf.get_at((0, 0))) == 4, f"{key} has no per-pixel alpha"
+    # one plate, cached: asking twice gives the SAME Surface, so no second read/scale
+    again = renderer_assets.load_assets(width, height)
+    assert again[key] is surf, f"{key} rebuilt on every load_assets call"
+
+
+def test_menu_blits_the_plate_not_a_flat_fill():
+    """draw_menu paints the menu plate over the whole screen; the UI bands still draw."""
+    pygame.init()
+    screen = pygame.display.set_mode((1920, 1080))
+    rend = renderer_mod.Renderer(screen)
+    screen.fill((7, 13, 23))          # sentinel nothing in the plate matches
+    rend.draw_menu(1)
+    got = pygame.surfarray.array3d(screen).transpose(1, 0, 2)      # [y][x][3]
+    plate = pygame.surfarray.array3d(rend.assets[renderer_assets.MENU_PLATE]).transpose(1, 0, 2)
+
+    # regions the UI does NOT paint over: left of the title/buttons and right of them
+    for y0, y1, x0, x1 in ((300, 1079, 0, 700), (300, 1079, 1200, 1919)):
+        a, b = got[y0:y1, x0:x1], plate[y0:y1, x0:x1]
+        drift = float(np.abs(a.astype(np.int32) - b.astype(np.int32)).mean())
+        assert drift < 8, f"menu region y{y0}..{y1} x{x0}..{x1} differs from the plate by L1 {drift:.1f}"
+    flat = int((np.abs(got.astype(np.int32) - np.array([30, 30, 50])).max(axis=2) == 0).sum())
+    assert flat < 1000, f"{flat} px still the old flat menu fill -- plate not blitted"
+
+    # the button rects are drawn ON TOP of the plate, so they must differ from it
+    band = got[432:828, 795:1069]
+    plate_band = plate[432:828, 795:1069]
+    assert float(np.abs(band.astype(np.int32) - plate_band.astype(np.int32)).mean()) > 10, \
+        "button column was not painted over the plate"
+
+
+def test_dead_asset_files_are_gone_and_mouse_sizes_still_resolve():
+    """The duplicate mouse plates and the never-blitted dust plate are not shipped;
+    the three mouse sizes still come out of the one plate."""
+    generated = os.path.join(os.path.dirname(renderer_assets.__file__), "assets", "generated")
+    for gone in ("mouse_small.png", "mouse_medium.png", "dust_puff.png"):
+        path = os.path.join(generated, gone)
+        assert not os.path.exists(path), f"dead asset still on disk: {path}"
+    assert renderer_assets.LAZY_SPRITES == {}, "LAZY_SPRITES still holds a plate nothing blits"
+
+    assets = renderer_assets.load_assets(1920, 1080)
+    assert "dust_puff" not in assets, "loader still hands out dust_puff"
+    want = {"mouse_small": (66, 54), "mouse_medium": (87, 72), "mouse_large": (120, 99)}
+    for key, size in want.items():
+        surf = assets[key]
+        assert isinstance(surf, pygame.Surface), f"{key} is not a Surface"
+        assert surf.get_size() == size, f"{key} is {surf.get_size()} != {size}"
+
+
+def test_frame_artifacts_stay_out_of_the_repo():
+    """The suite's saved frame goes somewhere OUTSIDE the project, so running tests
+    leaves no scratch folder behind."""
+    repo = os.path.dirname(os.path.abspath(renderer_assets.__file__))
+    target = os.path.abspath(PREVIEW_DIR)
+    assert not os.path.normcase(target).startswith(os.path.normcase(repo)), \
+        f"preview dir {target} lives inside the project ({repo})"
+
+
 def run_tests():
     tests = [
         test_asset_paths_resolve,
@@ -390,6 +593,15 @@ def run_tests():
         test_cloud_tinted_variants_exist_for_every_theme,
         test_cloud_positions_drift_and_wrap,
         test_background_blits_the_cloud_plate,
+        test_icon_asset_ships_the_sizes_windows_needs,
+        test_icon_crop_is_the_face_not_the_whole_body,
+        test_icon_tile_is_a_rounded_tile_on_daytime_sky,
+        test_shipped_icon_matches_the_tool_output,
+        test_spec_points_at_the_icon_asset,
+        test_menu_plate_loaded_once_at_display_size,
+        test_menu_blits_the_plate_not_a_flat_fill,
+        test_dead_asset_files_are_gone_and_mouse_sizes_still_resolve,
+        test_frame_artifacts_stay_out_of_the_repo,
     ]
     passed = 0
     failed = 0
